@@ -1,0 +1,1149 @@
+====== Projekt: Generowanie spójnych grafów całkowitych rzędu n = 16, k = 46 (OpenMP / CUDA) ======
+
+
+==== Streszczenie ====
+
+Projekt dotyczy generowania i zliczania **spójnych grafów całkowitych** rzędu $n = 16$
+o rozmiarze (liczbie krawędzi) $k = 46$. Graf nazywamy //całkowitym//, gdy wszystkie
+wartości własne jego macierzy sąsiedztwa są liczbami całkowitymi. Grafy generowane są
+pakietem **nauty** (program ''geng''), a następnie przepuszczane przez //sito spektralne//,
+które odrzuca grafy o niecałkowitym widmie. Zaimplementowano trzy wersje sita: sekwencyjną,
+równoległą **OpenMP** oraz **CUDA**, i porównano je z kodami referencyjnymi prowadzącego
+(''sito5'' dla CPU oraz ''sito8'' dla GPU). Wszystkie wersje dają identyczne wyniki
+(zgodne z ciągiem OEIS A064731). Na próbce **50 mln** grafów autorskie implementacje są
+istotnie szybsze od referencyjnych: wersja sekwencyjna **2,48×** szybsza od ''sito5'',
+OpenMP **24,6×** szybsza od ''sito5'', a wersja CUDA **~1900×** szybsza od ''sito8''.
+Wersja CUDA — dzięki zrównolegleniu przygotowania danych na hoście (OpenMP) przy
+zachowaniu solvera na GPU — jest **najszybsza ze wszystkich** (1,51× szybsza od OpenMP).
+Dodatkowo zaimplementowano wariant zintegrowany **GEN** (geng wkompilowany jako
+biblioteka), który end-to-end jest ~4,9× szybszy od potoku ''geng | sito''.
+W przebadanej próbce znaleziono **3** spójne grafy całkowite ($k=46$), które — po
+sprowadzeniu do postaci kanonicznej — **nie występują** w referencyjnej liście
+''grafy16L.graph6'' (375 grafów całkowitych $n=16$), są więc względem niej nowe.
+
+
+
+----
+
+
+==== Opis problemu ====
+
+Dla $n = 16$ i $k = 46$ liczba spójnych grafów jest ogromna (setki milionów), dlatego
+istotna jest zarówno wydajna **generacja** (nauty ''geng'' z podziałem ''res/mod''),
+jak i wydajne **sito** sprawdzające całkowitość widma. Sito musi być policzalne dla
+dziesiątek milionów instancji — stąd zrównoleglenie (OpenMP, CUDA).
+
+Test całkowitości realizowany jest metodą **Householdera** (redukcja symetrycznej
+macierzy do postaci trójprzekątniowej) oraz **bisekcji opartej na ciągach Sturma**,
+wyznaczającej kolejne wartości własne. Zastosowano **wczesne odrzucenie**: gdy bieżący
+przedział bisekcji nie może już zawierać liczby całkowitej, graf jest natychmiast
+odrzucany (bez liczenia pozostałych wartości własnych). Jest to ta sama metoda, co w
+kodzie referencyjnym ''sito5''.
+----
+==== Spis zaimplementowanych algorytmów ====
+
+^ Lp. ^ Algorytm (KOD) ^ Kategoria ^ Przeznaczenie ^ Uwagi ^
+| 1 | SEQ  | Sito sekwencyjne | Test całkowitości widma | $\mathcal{O}(n^3)$ na graf |
+| 2 | OMP  | Sito równoległe (CPU) | jw., wiele grafów równolegle | $\mathcal{O}(n^3/p)$ |
+| 3 | CUDA | Sito równoległe (GPU) | jw., 1 wątek = 1 graf | $\mathcal{O}(n^3/k)$ |
+| 4 | GEN  | Generator+sito zintegrowany | geng jako biblioteka (OUTPROC) | OpenMP, bez potoku |
+
+----
+
+==== Opis algorytmu sekwencyjnego ====
+
+^ Algorytm SEQ: Sito spektralne — wersja sekwencyjna ^^
+| ** Dane: ** | Strumień grafów w formacie graph6 (stdin). |
+| ** Wynik: ** | Grafy całkowite wypisane na stdout / do pliku. |
+| ** Metoda: ** | <WRAP>
+  - Wczytanie linii (graph6) i dekodowanie do spakowanej dolnotrójkątnej macierzy sąsiedztwa $a[\,]$.
+  - Redukcja Householdera macierzy symetrycznej do postaci trójprzekątniowej.
+  - Wyznaczenie ograniczeń Gershgorina na wartości własne.
+  - Bisekcja (ciągi Sturma) kolejnych wartości własnych $k = n, n-1, \dots, 1$.
+    - Wczesne odrzucenie: jeśli $\lfloor w \rfloor < s$ (przedział $[s,w]$ nie zawiera liczby całkowitej) — odrzuć graf.
+  - Jeżeli każda wartość własna jest odległa od liczby całkowitej o mniej niż $\epsilon$ — graf jest całkowity.
+</WRAP> |
+| ** Złożoność: ** | $\mathcal{O}(n^3)$ dla pojedynczego grafu. |
+
+**Optymalizacja względem ''sito5'':** kod referencyjny używa typu ''long double''
+(80-bitowa arytmetyka x87, wolna na współczesnych x86). Wersja autorska używa ''double''
+(SSE2), zachowując ten sam algorytm i wczesne odrzucenie. Daje to **2,45×** przyspieszenia
+przy **identycznych** wynikach. Dodatkowo ''double'' jest zgodny z GPU (brak ''long double''
+w CUDA), co umożliwia współdzielenie rdzenia obliczeniowego między wszystkimi wersjami.
+
+==== Opis algorytmu równoległego OpenMP ====
+
+^ Algorytm OMP: Sito spektralne — wersja OpenMP ^^
+| ** Dane: ** | Strumień graph6 (stdin), czytany blokowo. |
+| ** Wynik: ** | Grafy całkowite (deterministyczna kolejność). |
+| ** Metoda: ** | <WRAP>
+  - Blokowy odczyt ''read()'' dużymi porcjami (16 MiB) zamiast ''fgets()'' linia po linii.
+  - Podział porcji na linie //in-place// (bez kopiowania napisów) — tablica wskaźników.
+  - Pętla ''#pragma omp parallel for schedule(runtime) default(none)'' — 1 graf = 1 zadanie.
+  - Każdy wątek ma własny komplet struktur solvera (na stosie) — brak fałszywego współdzielenia.
+  - Wyniki 1/0 zapisywane do rozłącznych komórek tablicy ''hit[]'' (brak wyścigu, bez sekcji krytycznej w pętli gorącej).
+  - Szeregowy, deterministyczny wypis trafień po pętli.
+</WRAP> |
+| ** Złożoność: ** | $\mathcal{O}(n^3 / p)$, $p$ — liczba wątków. |
+| ** Skalowalność: ** | Przyspieszenie ~8,2× przy 16 wątkach (próbka 2 mln); nasycenie ~8–12 wątków z powodu serializowanego I/O. |
+
+Obowiązkowo zastosowano ''default(none)'' z jawną specyfikacją zmiennych dzielonych i
+prywatnych. Szeregowanie sterowane ''OMP_SCHEDULE'' (domyślnie ''guided'') — wczesne
+odrzucenie powoduje dużą zmienność czasu pojedynczego grafu, więc szeregowanie
+dynamiczne/guided równoważy obciążenie wątków. Wariant zintegrowany (geng jako biblioteka)
+opisano osobno jako algorytm **GEN** poniżej.
+
+==== Opis algorytmu równoległego CUDA ====
+
+^ Algorytm CUDA: Sito spektralne — wersja GPU ^^
+| ** Dane: ** | Strumień graph6 (stdin), czytany blokowo i buforowany w porcje. |
+| ** Wynik: ** | Tablica flag 1/0; trafienia wypisywane na hoście. |
+| ** Metoda: ** | <WRAP>
+  - Blokowy odczyt ''read()'' (16 MiB) i podział na linie in-place na hoście.
+  - **Równoległe** (OpenMP) kodowanie każdego grafu **binarnie** do bitmapy dolnego trójkąta (słowa 32-bit) — przygotowanie wsadu dla GPU.
+  - Układ **SoA** (Structure of Arrays): bity grafu $idx$ w $d\_bits[w \cdot num + idx]$ — sąsiednie wątki czytają sąsiednie adresy (dostęp scalony).
+  - Kopiowanie porcji blokiem H→D (''cudaMemcpy''), jedno uruchomienie jądra na całą porcję.
+  - W jądrze: 1 wątek = 1 graf; odtworzenie macierzy z bitmapy i ten sam solver (Householder + bisekcja) co na CPU.
+  - Kopiowanie wyników D→H i wypis trafień.
+</WRAP> |
+| ** Złożoność: ** | $\mathcal{O}(n^3 / k)$, $k$ — liczba równoległych rdzeni. |
+
+Rdzeń obliczeniowy jest **wspólny** (plik ''integral_bits.h'', funkcja ''__host__ __device__''),
+więc wynik GPU jest **bajt-w-bajt identyczny** z wersją CPU. Przygotowanie danych na
+hoście (dekodowanie graph6) jest zrównoleglone przez OpenMP, by nie dławić szybkiego
+jądra GPU — sam **solver pozostaje w całości na GPU**, algorytm jest niezmieniony.
+Liczba wątków w bloku jest parametrem wywołania (nie zaszyta na 256). Wariant ''float''
+został **porzucony**: progi
+zbieżności bisekcji ($2{,}91\cdot10^{-16}$) są dobrane pod precyzję ''double''; we ''float''
+pętla bisekcji się nie zbiega — jest wolniejsza i mniej dokładna. **Wniosek:** algorytm
+bisekcji Sturma wymaga podwójnej precyzji (nie każdy algorytm zyskuje na niższej precyzji).
+
+==== Opis algorytmu zintegrowanego (Generator + sito) ====
+
+^ Algorytm GEN: Zintegrowany generator + sito (OpenMP) ^^
+| ** Dane: ** | Parametry $n$, $k$ (bez potoku i bez pliku pośredniego). |
+| ** Wynik: ** | Grafy całkowite wypisywane w trakcie generacji (callback). |
+| ** Metoda: ** | <WRAP>
+  - ''geng'' wkompilowany jako biblioteka (''-DGENG_MAIN=geng_main'', ''-DOUTPROC=process_graph''); używa wątkowo-lokalnej wersji nauty (''-DUSE_TLS'', ''nautyTL.a'').
+  - Przestrzeń generacji dzielona na nadmiarową liczbę partycji ''res/mod'' (oversubscribe: $16 \times$ liczba wątków).
+  - Partycje rozdzielane dynamicznie ''#pragma omp parallel for schedule(dynamic,1)'' — bo geng dzieli przestrzeń nierównomiernie (różnice 10×+ między partycjami).
+  - Dla każdego wygenerowanego grafu wywoływany jest callback ''process_graph'', który wykonuje sito (Householder + bisekcja) bezpośrednio na strukturze nauty.
+  - Eliminuje potok i serializowany odczyt graph6: brak kodowania/dekodowania napisów oraz I/O między procesami.
+</WRAP> |
+| ** Złożoność: ** | $\mathcal{O}(G \cdot n^3 / p)$, $G$ — liczba grafów, $p$ — liczba wątków. |
+
+Wariant GEN usuwa wąskie gardło sekwencyjnego I/O obecne w wersjach potokowych
+(SEQ/OMP/CUDA czytają graph6 ze ''stdin'' jednym wątkiem).
+
+----
+
+==== Przykładowe dane wejściowe i wyniki ====
+
+Weryfikacja poprawności względem OEIS A064731 (liczba spójnych grafów całkowitych):
+
+^ $n$ ^ 5 ^ 6 ^ 7 ^ 8 ^ 9 ^
+^ liczba grafów całkowitych ^ 3 ^ 6 ^ 7 ^ 22 ^ 24 ^
+
+Wszystkie wersje (SEQ, OMP, CUDA, a także ''sito5'' i ''sito8'') dają powyższe liczby.
+Na próbce 2 mln grafów $n=16, k=46$ każda wersja znajduje **3** grafy całkowite, a wynik
+''sito_omp'' i ''sito_cuda'' jest **bajt-w-bajt identyczny** z wersją sekwencyjną.
+
+== Znalezione grafy całkowite (n=16, k=46) ==
+
+W przebadanej próbce znaleziono **3** grafy całkowite (w kodowaniu graph6):
+
+<code>
+O???????????~}~|^|f~]
+O???????????~}~|^~V~i
+O???????????~}~|^}v~q
+</code>
+
+== Etykietowanie kanoniczne ==
+
+Po wygenerowaniu grafów sprowadza się je do postaci kanonicznej (''labelg'' z pakietu
+nauty), aby zweryfikować, czy nie są wzajemnie izomorficzne (różne etykiety kanoniczne
+⇒ grafy nieizomorficzne):
+
+<code>
+labelg -q wyniki_0.g6 > wyniki_0_kanoniczne.g6
+</code>
+
+Zawartość ''wyniki_0_kanoniczne.g6'' (trzy różne etykiety ⇒ trzy nieizomorficzne grafy):
+
+<code>
+O???????????^~v~V~b~z
+O???????????n~n~n~b~x
+O???????????n~n~N~r~y
+</code>
+
+== Porównanie ze znaną listą grafów całkowitych (''grafy16L.graph6'') ==
+
+
+
+**Wszystkie 3 znalezione grafy całkowite (k=46) nie występują w liście
+''grafy16L.graph6'' — są względem niej nowe.**
+== Skrypt konwersji graph6 → graphviz (DokuWiki) ==
+
+Każdą linię ''.g6'' można skonwertować na blok ''graphviz'' osadzony w DokuWiki przy
+pomocy skryptu w Pythonie (''scripts/g6_to_dokuwiki.py''), korzystającego z bibliotek
+''networkx'' i ''numpy'' do dekodowania grafu oraz obliczenia widma:
+
+<code python>
+import sys
+import networkx as nx
+import numpy as np
+
+def todokuwiki(G, graf6, Sp):
+    n = nx.number_of_nodes(G)
+    s = '<graphviz circo>\ngraph g{'
+    for i in range(n):
+        s += str(i+1) + ';'
+    for e in G.edges:
+        s += str(e[0]+1) + '--' + str(e[1]+1) + ';'
+    s += 'label="k:' + str(len(G.edges)) + ', g6:\\"' + graf6 + '\\",\n Sp=' + Sp + '";\n'
+    s += '}\n</graphviz>'
+    return s
+
+if __name__ == "__main__":
+    graf6 = sys.argv[1] if (len(sys.argv) > 1) else "@"
+    G = nx.from_graph6_bytes(graf6.strip().encode("utf-8"))
+    Sp = "[" + ",".join(["{:.4f}".format(float(i))
+         for i in reversed(np.linalg.eigvalsh(nx.to_numpy_array(G)))]) + "]"
+    print(todokuwiki(G, graf6, Sp))
+</code>
+
+Wsadowe wygenerowanie bloków dla wszystkich znalezionych grafów:
+
+<code>
+while read g6; do python3 scripts/g6_to_dokuwiki.py "$g6"; done < data/wyniki_0.g6 > data/wyniki.dokuwiki
+</code>
+
+== Wizualizacja wygenerowanych grafów ==
+
+Wszystkie trzy grafy mają jedną dominującą wartość własną $+7$ i jedną $-6$ oraz wielokrotne
+zero — typowa struktura dla gęstego grafu dwudzielnego rzędu 16 o rozkładzie stopni 7+9.
+
+Graf 1 — spektrum $[7, 1, 1, 0^{9}, -1, -2, -6]$
+<graphviz circo>
+graph g{1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;1--13;1--14;1--15;1--16;2--13;2--14;2--15;2--16;3--13;3--14;3--15;3--16;4--13;4--14;4--15;4--16;5--13;5--14;5--15;5--16;6--13;6--14;6--15;6--16;7--13;7--14;7--15;7--16;8--13;8--14;8--15;8--16;9--13;9--14;9--15;9--16;10--13;10--14;11--13;11--15;11--16;12--14;12--15;12--16;13--16;14--16;label="k:46, g6:\"O???????????~}~|^|f~]\",
+ Sp=[7.0000,1.0000,1.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,-0.0000,-0.0000,-1.0000,-2.0000,-6.0000]";
+}
+</graphviz>
+
+Graf 2 — spektrum $[7, 2, 0^{10}, -1, -1, -1, -6]$
+<graphviz circo>
+graph g{1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;1--13;1--14;1--15;1--16;2--13;2--14;2--15;2--16;3--13;3--14;3--15;3--16;4--13;4--14;4--15;4--16;5--13;5--14;5--15;5--16;6--13;6--14;6--15;6--16;7--13;7--14;7--15;7--16;8--13;8--14;8--15;8--16;9--13;9--14;9--15;9--16;10--13;10--14;10--15;10--16;11--13;11--15;12--14;12--16;13--15;14--16;label="k:46, g6:\"O???????????~}~|^~V~i\",
+ Sp=[7.0000,2.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,-0.0000,-0.0000,-1.0000,-1.0000,-1.0000,-6.0000]";
+}
+</graphviz>
+
+Graf 3 — spektrum $[7, 1, 1, 0^{9}, -1, -2, -6]$
+<graphviz circo>
+graph g{1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;1--13;1--14;1--15;1--16;2--13;2--14;2--15;2--16;3--13;3--14;3--15;3--16;4--13;4--14;4--15;4--16;5--13;5--14;5--15;5--16;6--13;6--14;6--15;6--16;7--13;7--14;7--15;7--16;8--13;8--14;8--15;8--16;9--13;9--14;9--15;9--16;10--13;10--14;10--15;10--16;11--13;11--16;12--14;12--15;13--15;14--16;label="k:46, g6:\"O???????????~}~|^}v~q\",
+ Sp=[7.0000,1.0000,1.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,-0.0000,-1.0000,-2.0000,-6.0000]";
+}
+</graphviz>
+
+==== Kody programów ====
+
+
+== Listing: wspólny rdzeń sita — integral.h ==
+
+<code c integral.h>
+#ifndef INTEGRAL_H
+#define INTEGRAL_H
+
+#include <math.h>
+
+#define NMAX 20
+#define INT_TOL 1e-4   /* tolerancja "bliskosci" do liczby calkowitej */
+
+static inline int eigentest(const char *BUFOR)
+{
+    int i, j, k, k3, k4, L, L1, z, cond;
+    double eps, g, h, ma, mn, norm, s, t, u, w;
+    double d[NMAX + 1], e[NMAX + 1], e2[NMAX + 1], Lb[NMAX + 1], x[NMAX + 1];
+    double a[NMAX * (NMAX - 1) / 2 + NMAX + 1];
+    int n, bit = 32, poz = 1, poz2 = 1;
+
+    n = BUFOR[0] - 63;
+    a[0] = 0.0;
+
+    /* graph6 -> dolnotrojkatna spakowana macierz sasiedztwa (indeksowanie od 1) */
+    for (i = 0; i < n; i++)
+        for (j = 0; j <= i; j++) {
+            if (i == j) { a[poz2++] = 0.0; }
+            else {
+                if (bit == 0) { bit = 32; poz++; }
+                a[poz2++] = ((BUFOR[poz] - 63) & bit) ? 1.0 : 0.0;
+                bit >>= 1;
+            }
+        }
+
+    const int k1 = 1, k2 = n;
+
+    i = 0;
+    for (L = 1; L <= n; L++) { i += L; d[L] = a[i]; }
+
+    /* --- Redukcja Householdera do postaci trojprzekatniowej --- */
+    for (L = n; L >= 2; L--) {
+        i--; j = i; h = a[j]; s = 0;
+        for (k = L - 2; k >= 1; k--) { i--; g = a[i]; s += g * g; }
+        i--;
+        if (s == 0) { e[L] = h; e2[L] = h * h; a[j] = 0.0; }
+        else {
+            s += h * h; e2[L] = s; g = sqrt(s); if (h >= 0.0) g = -g;
+            e[L] = g;
+            s = 1.0 / (s - h * g);
+            a[j] = h - g; h = 0.0; L1 = L - 1; k3 = 1;
+            for (j = 1; j <= L1; j++) {
+                k4 = k3; g = 0;
+                for (k = 1; k <= L1; k++) {
+                    g += a[k4] * a[i + k];
+                    if (k < j) z = 1; else z = k;
+                    k4 += z;
+                }
+                k3 += j; g *= s; e[j] = g; h += a[i + j] * g;
+            }
+            h *= 0.5 * s; k3 = 1;
+            for (j = 1; j <= L1; j++) {
+                s = a[i + j]; g = e[j] - h * s; e[j] = g;
+                for (k = 1; k <= j; k++) { a[k3] += -s * e[k] - a[i + k] * g; k3++; }
+            }
+        }
+        h = d[L]; d[L] = a[i + L]; a[i + L] = h;
+    }
+
+    h = d[1]; d[1] = a[1]; a[1] = h; e[1] = 0.0; e2[1] = 0.0; s = d[n];
+    t = fabs(e[n]); mn = s - t; ma = s + t;
+    for (i = n - 1; i >= 1; i--) {
+        u = fabs(e[i]); h = t + u; t = u; s = d[i];
+        u = s - h; if (u < mn) mn = u;
+        u = s + h; if (u > ma) ma = u;
+    }
+    for (i = 1; i <= n; i++) { Lb[i] = mn; x[i] = ma; }
+    norm = fabs(mn); s = fabs(ma); if (s > norm) norm = s;
+    w = ma; eps = 7.28e-17 * norm;
+
+    /* --- Bisekcja kolejnych wartosci wlasnych z wczesnym odrzuceniem --- */
+    for (k = k2; k >= k1; k--) {
+        s = mn; i = k;
+        do { cond = 0; g = Lb[i];
+             if (s < g) s = g; else { i--; if (i >= k1) cond = 1; }
+        } while (cond);
+        g = x[k]; if (w > g) w = g;
+        while (w - s > 2.91e-16 * (fabs(s) + fabs(w)) + eps) {
+            if (floor(w + INT_TOL) < s - INT_TOL) return 0;  /* brak liczby calk. */
+            L1 = 0; g = 1.0; t = 0.5 * (s + w);
+            for (i = 1; i <= n; i++) {
+                if (g != 0) g = e2[i] / g; else g = fabs(6.87e15 * e[i]);
+                g = d[i] - t - g;
+                if (g < 0) L1++;
+            }
+            if (L1 < k1) { s = t; Lb[k1] = s; }
+            else if (L1 < k) { s = t; Lb[L1 + 1] = s; if (x[L1] > t) x[L1] = t; }
+            else w = t;
+        }
+        u = 0.5 * (s + w); x[k] = u;
+        if (!((ceil(u) - u < INT_TOL) || (u - floor(u) < INT_TOL))) return 0;
+    }
+    return 1;
+}
+
+#endif /* INTEGRAL_H */
+</code>
+
+== Listing: wersja sekwencyjna — sito_seq.c ==
+
+<code c sito_seq.c>
+#include <stdio.h>
+#include <stdlib.h>
+#include "integral.h"
+
+#define BUFSIZE 1024
+
+int main(int argc, char *argv[])
+{
+    FILE *out = stdout;
+    if (argc > 1) {
+        out = fopen(argv[1], "w");
+        if (!out) { perror(argv[1]); return EXIT_FAILURE; }
+    }
+
+    char buf[BUFSIZE];
+    long long total = 0, integral = 0;
+
+    while (fgets(buf, BUFSIZE, stdin)) {
+        if (buf[0] == '\n' || buf[0] == '\0') continue;
+        total++;
+        if (eigentest(buf)) { integral++; fputs(buf, out); }
+    }
+
+    if (out != stdout) fclose(out);
+    fprintf(stderr, "[sito_seq] przebadane=%lld calkowite=%lld\n", total, integral);
+    return EXIT_SUCCESS;
+}
+</code>
+
+== Listing: wersja OpenMP — sito_omp.c ==
+
+<code c sito_omp.c>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <omp.h>
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#define READ _read
+#else
+#include <unistd.h>
+#define READ read
+#endif
+#include "integral.h"
+
+#define CHUNK   (16 * 1024 * 1024)   /* rozmiar bloku odczytu */
+#define MAXLINE 1024
+
+int main(int argc, char *argv[])
+{
+    FILE *out = stdout;
+    if (argc > 1) {
+        out = fopen(argv[1], "w");
+        if (!out) { perror(argv[1]); return EXIT_FAILURE; }
+    }
+#ifdef _WIN32
+    _setmode(0, _O_BINARY);           /* bez translacji \r\n na wejsciu */
+#endif
+    /* domyslnie 'guided'; nadpisywalne przez OMP_SCHEDULE */
+    if (!getenv("OMP_SCHEDULE")) omp_set_schedule(omp_sched_guided, 0);
+
+    char  *buf   = (char *)malloc(CHUNK + MAXLINE + 1);
+    char **lines = NULL;
+    size_t lines_cap = 0;
+    size_t carry = 0;
+    long long total = 0, integral = 0;
+
+    double t0 = omp_get_wtime();
+
+    long r;
+    while ((r = READ(0, buf + carry, CHUNK)) > 0) {
+        size_t avail = carry + (size_t)r;
+
+        /* znajdz koniec ostatniej kompletnej linii */
+        size_t proc = 0;
+        for (size_t p = avail; p > 0; p--)
+            if (buf[p - 1] == '\n') { proc = p; break; }
+
+        /* policz linie i (raz) powieksz tablice wskaznikow */
+        size_t nlines = 0;
+        for (size_t p = 0; p < proc; p++) if (buf[p] == '\n') nlines++;
+        if (nlines > lines_cap) {
+            lines_cap = nlines;
+            lines = (char **)realloc(lines, lines_cap * sizeof(char *));
+        }
+
+        /* podziel [0,proc) na linie in-place (znaki '\0') */
+        size_t li = 0, start = 0;
+        for (size_t p = 0; p < proc; p++) {
+            if (buf[p] == '\n') {
+                size_t end = p;
+                if (end > start && buf[end - 1] == '\r') end--;
+                buf[end] = '\0';
+                if (end > start) lines[li++] = buf + start;
+                start = p + 1;
+            }
+        }
+        nlines = li;
+        total += (long long)nlines;
+
+        /* rownolegle sito; wyniki do rozlacznych komorek hit[] */
+        char *hit = (char *)calloc(nlines ? nlines : 1, 1);
+        long long batch = 0;
+        #pragma omp parallel for schedule(runtime) \
+                default(none) shared(lines, hit, nlines) reduction(+:batch)
+        for (long long gi = 0; gi < (long long)nlines; gi++) {
+            if (eigentest(lines[gi])) { hit[gi] = 1; batch++; }
+        }
+
+        /* szeregowy, deterministyczny wypis trafien */
+        for (size_t gi = 0; gi < nlines; gi++)
+            if (hit[gi]) { fputs(lines[gi], out); fputc('\n', out); }
+        free(hit);
+        integral += batch;
+
+        /* przenies niekompletna koncowke na poczatek bufora */
+        carry = avail - proc;
+        memmove(buf, buf + proc, carry);
+    }
+
+    if (carry > 0) {                  /* ostatnia linia bez '\n' */
+        if (buf[carry - 1] == '\r') carry--;
+        buf[carry] = '\0';
+        if (carry > 0) {
+            total++;
+            if (eigentest(buf)) { integral++; fputs(buf, out); fputc('\n', out); }
+        }
+    }
+
+    double t1 = omp_get_wtime();
+    if (out != stdout) fclose(out);
+    free(buf); free(lines);
+    fprintf(stderr, "[sito_omp] watki=%d przebadane=%lld calkowite=%lld czas=%.3fs\n",
+            omp_get_max_threads(), total, integral, t1 - t0);
+    return EXIT_SUCCESS;
+}
+</code>
+
+== Listing: rdzeń binarny (dla CUDA) — integral_bits.h ==
+
+<code c integral_bits.h>
+#ifndef INTEGRAL_BITS_H
+#define INTEGRAL_BITS_H
+
+#include <math.h>
+#include <stdint.h>
+
+/* IB_QUAL: pod nvcc funkcja jest __host__ __device__, na CPU - static inline. */
+#ifdef __CUDACC__
+#define IB_QUAL static inline __host__ __device__
+#else
+#define IB_QUAL static inline
+#endif
+
+#define IB_NMAX  16
+#define IB_ASIZE (IB_NMAX*(IB_NMAX-1)/2 + IB_NMAX + 1)
+#define IB_MAXWORDS 8
+#define IB_INT_TOL 1e-4
+
+/* liczba slow 32-bit na dolny trojkat dla n wierzcholkow */
+static inline int ib_words_for(int n) { return (n * (n - 1) / 2 + 31) / 32; }
+
+/* HOST: graph6 -> bity dolnego trojkata (kolejnosc jak a[] w integral.h) */
+static inline void ib_g6_to_bits(const char *buf, int n, uint32_t *out, int nwords)
+{
+    for (int w = 0; w < nwords; w++) out[w] = 0u;
+    int bitg = 32, poz = 1, bitidx = 0;
+    for (int i = 1; i < n; i++)
+        for (int j = 0; j < i; j++) {
+            if (bitg == 0) { bitg = 32; poz++; }
+            if ((buf[poz] - 63) & bitg) out[bitidx >> 5] |= (1u << (bitidx & 31));
+            bitidx++;
+            bitg >>= 1;
+        }
+}
+
+/* RDZEN: test calkowitosci widma, dane = bitmapa dolnego trojkata.
+   Algorytm IDENTYCZNY jak w integral.h - rozni sie tylko zrodlem danych. */
+IB_QUAL int eigentest_bits(const uint32_t *bits, int n)
+{
+    int i, j, k, k3, k4, L, L1, z, cond;
+    double eps, g, h, ma, mn, norm, s, t, u, w;
+    double d[IB_NMAX + 1], e[IB_NMAX + 1], e2[IB_NMAX + 1], Lb[IB_NMAX + 1], x[IB_NMAX + 1];
+    double a[IB_ASIZE];
+    int poz2 = 1, bitidx = 0;
+
+    a[0] = 0.0;
+    /* bitmapa -> dolnotrojkatna spakowana macierz sasiedztwa (indeksowanie od 1) */
+    for (i = 0; i < n; i++)
+        for (j = 0; j <= i; j++) {
+            if (i == j) { a[poz2++] = 0.0; }
+            else {
+                a[poz2++] = ((bits[bitidx >> 5] >> (bitidx & 31)) & 1u) ? 1.0 : 0.0;
+                bitidx++;
+            }
+        }
+
+    const int k1 = 1, k2 = n;
+    i = 0;
+    for (L = 1; L <= n; L++) { i += L; d[L] = a[i]; }
+
+    /* --- Redukcja Householdera do postaci trojprzekatniowej --- */
+    for (L = n; L >= 2; L--) {
+        i--; j = i; h = a[j]; s = 0;
+        for (k = L - 2; k >= 1; k--) { i--; g = a[i]; s += g * g; }
+        i--;
+        if (s == 0) { e[L] = h; e2[L] = h * h; a[j] = 0.0; }
+        else {
+            s += h * h; e2[L] = s; g = sqrt(s); if (h >= 0.0) g = -g;
+            e[L] = g;
+            s = 1.0 / (s - h * g);
+            a[j] = h - g; h = 0.0; L1 = L - 1; k3 = 1;
+            for (j = 1; j <= L1; j++) {
+                k4 = k3; g = 0;
+                for (k = 1; k <= L1; k++) {
+                    g += a[k4] * a[i + k];
+                    if (k < j) z = 1; else z = k;
+                    k4 += z;
+                }
+                k3 += j; g *= s; e[j] = g; h += a[i + j] * g;
+            }
+            h *= 0.5 * s; k3 = 1;
+            for (j = 1; j <= L1; j++) {
+                s = a[i + j]; g = e[j] - h * s; e[j] = g;
+                for (k = 1; k <= j; k++) { a[k3] += -s * e[k] - a[i + k] * g; k3++; }
+            }
+        }
+        h = d[L]; d[L] = a[i + L]; a[i + L] = h;
+    }
+
+    h = d[1]; d[1] = a[1]; a[1] = h; e[1] = 0.0; e2[1] = 0.0; s = d[n];
+    t = fabs(e[n]); mn = s - t; ma = s + t;
+    for (i = n - 1; i >= 1; i--) {
+        u = fabs(e[i]); h = t + u; t = u; s = d[i];
+        u = s - h; if (u < mn) mn = u;
+        u = s + h; if (u > ma) ma = u;
+    }
+    for (i = 1; i <= n; i++) { Lb[i] = mn; x[i] = ma; }
+    norm = fabs(mn); s = fabs(ma); if (s > norm) norm = s;
+    w = ma; eps = 7.28e-17 * norm;
+
+    /* --- Bisekcja kolejnych wartosci wlasnych z wczesnym odrzuceniem --- */
+    for (k = k2; k >= k1; k--) {
+        s = mn; i = k;
+        do { cond = 0; g = Lb[i];
+             if (s < g) s = g; else { i--; if (i >= k1) cond = 1; }
+        } while (cond);
+        g = x[k]; if (w > g) w = g;
+        while (w - s > 2.91e-16 * (fabs(s) + fabs(w)) + eps) {
+            if (floor(w + IB_INT_TOL) < s - IB_INT_TOL) return 0;  /* brak liczby calk. */
+            L1 = 0; g = 1.0; t = 0.5 * (s + w);
+            for (i = 1; i <= n; i++) {
+                if (g != 0) g = e2[i] / g; else g = fabs(6.87e15 * e[i]);
+                g = d[i] - t - g;
+                if (g < 0) L1++;
+            }
+            if (L1 < k1) { s = t; Lb[k1] = s; }
+            else if (L1 < k) { s = t; Lb[L1 + 1] = s; if (x[L1] > t) x[L1] = t; }
+            else w = t;
+        }
+        u = 0.5 * (s + w); x[k] = u;
+        if (!((ceil(u) - u < IB_INT_TOL) || (u - floor(u) < IB_INT_TOL))) return 0;
+    }
+    return 1;
+}
+
+#endif /* INTEGRAL_BITS_H */
+</code>
+
+== Listing: wersja CUDA — sito_cuda.cu ==
+
+<code c sito_cuda.cu>
+/**
+@file sito_cuda.cu
+@brief Sito spektralne - wersja CUDA (wiele grafow jednoczesnie na GPU).
+
+Model obliczen (zgodnie z zaleceniem prowadzacego dla problemow grafowych):
+  * przetwarzamy WIELE instancji grafu jednoczesnie - 1 watek CUDA = 1 graf,
+  * struktura grafu kodowana BINARNIE przy przekazaniu do jadra: dolnotrojkatna
+    macierz sasiedztwa (n*(n-1)/2 bitow) pakowana w slowa 32-bitowe,
+  * uklad SoA (Structure of Arrays): bity grafu o numerze idx leza w
+    d_bits[w*num + idx] -> sasiednie watki czytaja sasiednie adresy
+    (dostep scalony / coalesced).
+
+Algorytm testu calkowitosci (eigentest_bits) jest we wspolnym naglowku
+integral_bits.h i jest IDENTYCZNY jak w wersji sekwencyjnej i OpenMP
+(integral.h) -> wyniki wszystkich wersji sa bit-w-bit takie same.
+
+Przygotowanie danych na hoscie (odczyt + dekodowanie graph6 -> bitmapa) jest
+zrownoleglone przez OpenMP - to czesc CPU, ktora przygotowuje wsad dla GPU.
+Wlasciwe sito (solver) pozostaje w calosci na GPU. Bez tego zrownoleglenia
+sekwencyjny odczyt na hoscie dominowalby czas (efekt Amdahla).
+
+Kompilacja (RTX 3060 Ti = Ampere, sm_86):
+  nvcc -O3 -arch=sm_86 -Xcompiler -fopenmp sito_cuda.cu -o sito_cuda
+
+Uruchomienie:
+  ./geng -cq 16 46:46 | ./sito_cuda                 # wypis na stdout
+  ./geng -cq 16 46:46 | ./sito_cuda wynik.g6        # zapis do pliku
+  ./geng -cq 16 46:46 | ./sito_cuda wynik.g6 256    # rozmiar bloku = 256
+  ./geng -cq  9       | ./sito_cuda - 1024 | wc -l  # '-' = stdout (test OEIS)
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <omp.h>
+#include <cuda_runtime.h>
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#define READ _read
+#else
+#include <unistd.h>
+#define READ read
+#endif
+#include "integral_bits.h"
+
+#define BUFSIZE 32                  /* dlugosc napisu graph6 (n<=22)            */
+#define CHUNK   (16 * 1024 * 1024)  /* rozmiar bloku odczytu hosta              */
+#define MAXLINE 64
+
+/* makro kontroli bledow CUDA (poprawne __FILE__/__LINE__) */
+#define CUDA_CHECK(call)                                                        \
+    do {                                                                       \
+        cudaError_t _err = (call);                                            \
+        if (_err != cudaSuccess) {                                            \
+            fprintf(stderr, "Blad CUDA %s:%d - %s\n",                         \
+                    __FILE__, __LINE__, cudaGetErrorString(_err));            \
+            exit(EXIT_FAILURE);                                              \
+        }                                                                    \
+    } while (0)
+
+
+/* jadro: kazdy watek testuje jeden graf (solver bez zmian - integral_bits.h) */
+__global__ void sieve_kernel(const uint32_t *__restrict__ d_bits,
+                             int *__restrict__ d_res,
+                             int n, int nwords, int num)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num) return;
+
+    uint32_t bits[IB_MAXWORDS];
+    for (int w = 0; w < nwords; w++)
+        bits[w] = d_bits[(size_t)w * num + idx];   /* dostep scalony (SoA) */
+
+    d_res[idx] = eigentest_bits(bits, n);
+}
+
+
+/* przetworzenie jednej porcji na GPU; zwraca liczbe znalezionych grafow.
+   lines[] -> wskazniki na napisy graph6 (do wypisania trafien). */
+static long long process_batch(char **lines, uint32_t *h_bits, int *h_res,
+                               uint32_t *d_bits, int *d_res,
+                               int count, int n, int nwords, int block,
+                               FILE *out, float *kernel_ms_accum)
+{
+    CUDA_CHECK(cudaMemcpy(d_bits, h_bits,
+                          (size_t)nwords * count * sizeof(uint32_t),
+                          cudaMemcpyHostToDevice));
+
+    int grid = (count + block - 1) / block;
+
+    cudaEvent_t e0, e1;
+    CUDA_CHECK(cudaEventCreate(&e0));
+    CUDA_CHECK(cudaEventCreate(&e1));
+    CUDA_CHECK(cudaEventRecord(e0));
+    sieve_kernel<<<grid, block>>>(d_bits, d_res, n, nwords, count);
+    CUDA_CHECK(cudaEventRecord(e1));
+    CUDA_CHECK(cudaEventSynchronize(e1));
+    float ms = 0; CUDA_CHECK(cudaEventElapsedTime(&ms, e0, e1));
+    *kernel_ms_accum += ms;
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventDestroy(e0));
+    CUDA_CHECK(cudaEventDestroy(e1));
+
+    CUDA_CHECK(cudaMemcpy(h_res, d_res, (size_t)count * sizeof(int),
+                          cudaMemcpyDeviceToHost));
+
+    long long found = 0;
+    for (int i = 0; i < count; i++)
+        if (h_res[i]) { fputs(lines[i], out); fputc('\n', out); found++; }
+    return found;
+}
+
+
+int main(int argc, char *argv[])
+{
+    FILE *out = stdout;
+    if (argc > 1 && strcmp(argv[1], "-") != 0) {
+        out = fopen(argv[1], "w");
+        if (!out) { perror(argv[1]); return EXIT_FAILURE; }
+    }
+    int block = 1024;                            /* domyslnie max watkow w bloku */
+    if (argc > 2) {
+        block = atoi(argv[2]);
+        if (block < 1 || block > 1024) { fprintf(stderr, "blok 1..1024; ustawiam 1024\n"); block = 1024; }
+    }
+#ifdef _WIN32
+    _setmode(0, _O_BINARY);                       /* bez translacji \r\n */
+#endif
+
+    /* maks. liczba grafow w jednej porcji (CHUNK / min. dlugosc linii) */
+    const int CAP = CHUNK / 4 + 16;
+
+    char     *buf    = (char *)    malloc(CHUNK + MAXLINE + 1);
+    char    **lines  = (char **)   malloc((size_t)CAP * sizeof(char *));
+    uint32_t *h_bits = (uint32_t *)malloc((size_t)CAP * IB_MAXWORDS * sizeof(uint32_t));
+    int      *h_res  = (int *)     malloc((size_t)CAP * sizeof(int));
+    uint32_t *d_bits = NULL; int *d_res = NULL;
+    CUDA_CHECK(cudaMalloc(&d_bits, (size_t)CAP * IB_MAXWORDS * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_res,  (size_t)CAP * sizeof(int)));
+
+    size_t carry = 0;
+    int n = 0, nwords = 0;
+    long long total = 0, integral = 0;
+    float kernel_ms = 0.0f;
+
+    cudaEvent_t w0, w1;
+    CUDA_CHECK(cudaEventCreate(&w0));
+    CUDA_CHECK(cudaEventCreate(&w1));
+    CUDA_CHECK(cudaEventRecord(w0));
+
+    long r;
+    while ((r = READ(0, buf + carry, CHUNK)) > 0) {
+        size_t avail = carry + (size_t)r;
+
+        /* koniec ostatniej kompletnej linii */
+        size_t proc = 0;
+        for (size_t p = avail; p > 0; p--)
+            if (buf[p - 1] == '\n') { proc = p; break; }
+
+        /* podzial na linie in-place -> tablica wskaznikow */
+        int cnt = 0; size_t start = 0;
+        for (size_t p = 0; p < proc; p++) {
+            if (buf[p] == '\n') {
+                size_t end = p;
+                if (end > start && buf[end - 1] == '\r') end--;
+                buf[end] = '\0';
+                if (end > start) lines[cnt++] = buf + start;
+                start = p + 1;
+            }
+        }
+        if (cnt == 0) { carry = avail - proc; memmove(buf, buf + proc, carry); continue; }
+
+        if (n == 0) { n = lines[0][0] - 63; nwords = ib_words_for(n); }
+        total += cnt;
+
+        /* RÓWNOLEGŁE dekodowanie graph6 -> bitmapa (SoA, skok = cnt) na CPU */
+        #pragma omp parallel for schedule(static) default(none) \
+                shared(lines, h_bits, cnt, n, nwords)
+        for (int gi = 0; gi < cnt; gi++) {
+            uint32_t tmp[IB_MAXWORDS];
+            ib_g6_to_bits(lines[gi], n, tmp, nwords);
+            for (int w = 0; w < nwords; w++)
+                h_bits[(size_t)w * cnt + gi] = tmp[w];
+        }
+
+        integral += process_batch(lines, h_bits, h_res, d_bits, d_res,
+                                  cnt, n, nwords, block, out, &kernel_ms);
+
+        carry = avail - proc;
+        memmove(buf, buf + proc, carry);
+    }
+
+    CUDA_CHECK(cudaEventRecord(w1));
+    CUDA_CHECK(cudaEventSynchronize(w1));
+    float wall_ms = 0; CUDA_CHECK(cudaEventElapsedTime(&wall_ms, w0, w1));
+
+    if (out != stdout) fclose(out);
+    free(buf); free(lines); free(h_bits); free(h_res);
+    CUDA_CHECK(cudaFree(d_bits));
+    CUDA_CHECK(cudaFree(d_res));
+
+    fprintf(stderr, "[sito_cuda] n=%d blok=%d watki_host=%d przebadane=%lld calkowite=%lld "
+                    "czas_jadra=%.3fs czas_calk=%.3fs\n",
+            n, block, omp_get_max_threads(), total, integral,
+            kernel_ms / 1000.0f, wall_ms / 1000.0f);
+    return EXIT_SUCCESS;
+}
+</code>
+
+== Listing: wariant zintegrowany (geng jako biblioteka) — program_omp.cpp (fragment) ==
+
+Pełny solver pominięto (identyczny jak w ''integral.h''); poniżej kluczowy mechanizm:
+callback ''process_graph'' wywoływany przez ''geng'' dla każdego grafu oraz równoległa
+pętla po partycjach ''res/mod''.
+
+<code cpp program_omp.cpp>
+extern "C" {
+#include "nauty.h"
+}
+#define MAX_NODES 16
+
+// OUTPROC callback - wywolywany przez geng_main dla kazdego grafu,
+// w kontekscie watku OMP ktory odpalil geng_main.
+extern "C" void process_graph(FILE * /*outfile*/, graph *g, int n)
+{
+    ThreadResult &r = g_thread_results[omp_get_thread_num()];
+    r.total++;
+    if (n <= 0 || n > MAX_NODES) return;
+
+    int adj[MAX_NODES][MAX_NODES];
+    for (int i = 0; i < n; i++) for (int j = 0; j < n; j++) adj[i][j] = 0;
+    for (int i = 0; i < n; i++) {                 // nauty graph -> macierz
+        setword row = g[i];
+        for (int j = 0; j < n; j++) if (row & bit[j]) adj[i][j] = 1;
+    }
+
+    double packed[TRI_SIZE], eig[MAX_NODES + 1];
+    matrix_to_lower_triangle(n, adj, packed);
+    compute_sym_eigenvalues(n, packed, 1, n, eig);   // Householder + bisekcja
+
+    if (all_eigenvalues_integral(n, eig)) {
+        r.integral++;
+        char g6[64]; encode_graph6_from_adj(n, adj, g6);
+        #pragma omp critical
+        { printf("%s\n", g6); fflush(stdout); }
+    }
+}
+
+extern "C" int geng_main(int argc, char *argv[]);
+
+int main(int argc, char *argv[])
+{
+    int n = (argc > 1) ? atoi(argv[1]) : 16;
+    int k = (argc > 2) ? atoi(argv[2]) : 46;
+    int n_threads = omp_get_max_threads();
+    g_thread_results.assign(n_threads, ThreadResult{});
+
+    // Nadmiar partycji wzgledem watkow -> dynamiczne rownowazenie,
+    // bo geng dzieli przestrzen res/mod nierownomiernie (roznice 10x+).
+    int partitions = n_threads * 16;
+
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int p = 0; p < partitions; p++) {
+        char nstr[16], estr[16], res[24];
+        snprintf(nstr, sizeof(nstr), "%d", n);
+        snprintf(estr, sizeof(estr), "%d:%d", k, k);
+        snprintf(res,  sizeof(res),  "%d/%d", p, partitions);
+        char *gargv[6] = {(char*)"geng", (char*)"-cq", nstr, estr, res, NULL};
+        geng_main(5, gargv);                      // wywoluje process_graph na kazdym grafie
+    }
+    return 0;
+}
+</code>
+
+----
+
+==== Architektura komputera ====
+
+<code json>
+{
+  "procesor": "Intel(R) Core(TM) i5-12600KF (12th Gen)",
+  "architektura": "x86_64",
+  "rdzenie_fizyczne": 10,
+  "watki_logiczne": 16,
+  "taktowanie_bazowe_MHz": 3700,
+  "pamiec_RAM_GB": 32,
+  "GPU": "NVIDIA GeForce RTX 3060 Ti",
+  "GPU_architektura": "Ampere (sm_86)",
+  "GPU_pamiec": "8192 MiB",
+  "kompilator_CPU": "gcc 13.2.0 (MSYS2/UCRT), -O3 -march=native",
+  "kompilator_GPU": "nvcc 13.3 + MSVC 14.42"
+}
+</code>
+
+----
+
+==== Testy programów i profilowanie ====
+
+  * **Zgodność wyników:** SEQ, OMP, CUDA, ''sito5'', ''sito8'' zgadzają się z OEIS A064731 (n=5..9 -> 3,6,7,22,24). Na 2 mln grafów n=16 wszystkie znajdują te same 3 grafy całkowite; wyjścia OMP i CUDA są bajt-w-bajt identyczne z SEQ (kolejność deterministyczna).
+  * **Hazardy:** w OMP każdy wątek zapisuje do rozłącznych komórek ''hit[]'' (izolacja zakresów indeksów) — brak współbieżnego zapisu do tej samej komórki. Solver operuje wyłącznie na zmiennych lokalnych (na stosie wątku) -> pełna reentrancja. Determinizm wyjścia potwierdza brak wyścigu.
+  * **I/O:** wejście zamrożono do pliku ''.g6'', aby pomiary nie były zaburzone szybkością generatora. Przy profilowaniu GPU wstrzymano animowaną tapetę obciążającą kartę.
+
+==== Analiza narzutów czasowych i przyspieszenia obliczeń ====
+
+Pomiary na **tej samej** próbce **50 mln** grafów $n=16, k=46$ (zamrożonej w pliku
+''.g6''; przepustowość = grafy/s):
+
+^ Wersja ^ Czas [s] ^ Przepustowość [graf/s] ^ Przyspieszenie vs ''sito5'' ^
+| ''sito5'' (ref., sekw., long double) | 214,8 | 232 753 | 1,00× (baza) |
+| **SEQ** (autorska, double) | 86,7 | 576 575 | **2,48×** |
+| **OMP** (autorska, 16 wątków) | 8,7 | 5 730 659 | **24,6×** |
+| **CUDA** (autorska, blok=32, host+OpenMP) | **5,8** | **8 653 513** | **37,2×** |
+| ''sito8'' (ref., GPU ''<<<1,1>>>''/graf) | ~11 023* | 4 536 | 0,02× |
+
+<wrap tip>* ''sito8'' zmierzono na 100 000 grafów (22,0 s = 4 536 graf/s) i ekstrapolowano na 50 mln (~3 h).</wrap>
+
+Wersja CUDA przygotowuje dane na hoście (odczyt + dekodowanie graph6 → bitmapa)
+**równolegle** przez OpenMP; właściwe sito (solver) pozostaje w całości na GPU. Dzięki
+temu narzut sekwencyjnego I/O nie dławi GPU i **CUDA jako całość jest najszybsza** —
+szybsza nawet od wersji OpenMP (5,8 s < 8,7 s, czyli **1,51×**).
+
+== Porównanie OpenMP: autorska vs sito5 ==
+
+  * Wersja sekwencyjna SEQ jest **2,48×** szybsza od ''sito5'' przy **identycznym algorytmie** — różnica wynika z typu ''double'' (SSE2) zamiast ''long double'' (x87, 80-bit) oraz lepszego I/O.
+  * Wersja OMP (16 wątków) jest **24,6×** szybsza od ''sito5'' (sekw.): na ten zysk składa się przyspieszenie z ''double'' (~2,5×) oraz zrównoleglenie na 16 wątków (~10×).
+
+== Porównanie CUDA: autorska vs sito8 ==
+
+  * **~1900× szybciej** od ''sito8'' (50 mln grafów: CUDA 5,8 s vs ''sito8'' ~3 h). ''sito8'' uruchamia jądro ''<<<1,1>>>'' (jeden wątek) osobno dla każdego grafu i synchronizuje po każdym — wykorzystuje ~0,001% rdzeni GPU i płaci pełny narzut uruchomienia jądra 50 mln razy (4 536 graf/s). Wersja autorska koduje grafy binarnie (bitmapa, układ SoA), kopiuje porcjami po ~4 mln i przetwarza tysiące grafów równolegle (8,65 mln graf/s).
+
+== Prawo Amdahla: rola I/O hosta ==
+
+  * Pierwotna wersja CUDA dekodowała graph6 na hoście **sekwencyjnie** — ten narzut dławił obliczenia na GPU (klasyczny efekt **prawa Amdahla**). Po zrównolegleniu dekodowania przez OpenMP narzut hosta przestał dominować i CUDA stała się najszybsza ze wszystkich wersji (50 mln: 5,8 s vs OMP 8,7 s, czyli 1,51×).
+  * Pozostały czas CUDA to przygotowanie danych na hoście i transfer H↔D, które rosną liniowo z rozmiarem zbioru.
+
+== Zagęszczenie pomiarów: czas w funkcji rozmiaru zbioru ==
+
+Zmierzono czas **całkowity** (wraz z I/O) autorskich wersji oraz referencyjnego ''sito5''
+dla rosnącej liczby grafów (jednolita metodyka, wejście zamrożone w pliku ''.g6'').
+
+^ Liczba grafów ^ ''sito5'' [s] ^ SEQ [s] ^ OMP (16 w.) [s] ^ CUDA [s] ^
+| 1 000 000  | 4,40   | 1,76  | 0,32 | 0,27 |
+| 5 000 000  | 21,79  | 8,69  | 0,93 | 0,76 |
+| 10 000 000 | 43,86  | 17,68 | 1,87 | 1,40 |
+| 20 000 000 | 86,40  | 34,59 | 3,64 | 2,47 |
+| 50 000 000 | 214,82 | 86,72 | 8,73 | 5,78 |
+
+<achart>
+ {
+  xaxis: { title: { text: "Liczba grafów (mln)", offsetY: 5 } },
+  yaxis: { title: { text: "Czas [ms]" }, logarithmic: true },
+  grid: { padding: { bottom: 25 } },
+  series: [
+    { name: "SEQ",        data: [1757, 8689, 17675, 34590, 86719] },
+    { name: "OpenMP 16w", data: [318, 932, 1869, 3642, 8725] },
+    { name: "CUDA",       data: [270, 759, 1396, 2470, 5778] }
+  ],
+  chart: { height: 400, type: 'line', zoom: { enabled: false } },
+  legend: { position: 'top' },
+  dataLabels: { enabled: false },
+  labels: [1, 5, 10, 20, 50],
+  stroke: { curve: 'straight', width: [3, 3, 3] },
+  colors: ['#008FFB', '#00E396', '#FF4560'],
+  markers: { size: 5 }
+ }
+</achart>
+
+== Przyspieszenie względem SEQ w funkcji rozmiaru ==
+
+<achart>
+ {
+  xaxis: { title: { text: "Liczba grafów (mln)", offsetY: 5 } },
+  yaxis: { title: { text: "Przyspieszenie ×" }, decimalsInFloat: 1 },
+  grid: { padding: { bottom: 25 } },
+  series: [
+    { name: "SEQ (baza)",  data: [1, 1, 1, 1, 1], type: 'line' },
+    { name: "OpenMP 16w",  data: [5.53, 9.32, 9.46, 9.50, 9.94] },
+    { name: "CUDA",        data: [6.51, 11.45, 12.66, 14.00, 15.01] }
+  ],
+  chart: { height: 400, type: 'line', zoom: { enabled: false } },
+  legend: { position: 'top' },
+  dataLabels: { enabled: false },
+  labels: [1, 5, 10, 20, 50],
+  stroke: { curve: 'straight', width: [2, 3, 3], dashArray: [5, 0, 0] },
+  colors: ['#778899', '#00E396', '#FF4560'],
+  markers: { size: 5 }
+ }
+</achart>
+
+== Porównanie OpenMP vs ''sito5'' (czas) ==
+
+<achart>
+ {
+  xaxis: { title: { text: "Liczba grafów (mln)", offsetY: 5 } },
+  yaxis: { title: { text: "Czas [ms]" }, logarithmic: true },
+  grid: { padding: { bottom: 25 } },
+  series: [
+    { name: "OMP (autorska)",      data: [318, 932, 1869, 3642, 8725] },
+    { name: "sito5 (ref. sekw.)",  data: [4404, 21786, 43856, 86397, 214820] }
+  ],
+  chart: { height: 400, type: 'line', zoom: { enabled: false } },
+  legend: { position: 'top' },
+  dataLabels: { enabled: false },
+  labels: [1, 5, 10, 20, 50],
+  stroke: { curve: 'straight', width: [3, 3] },
+  colors: ['#00E396', '#008FFB'],
+  markers: { size: 5 }
+ }
+</achart>
+
+== Porównanie CUDA vs ''sito8'' (czas, skala log) ==
+
+''sito8'' jest bardzo wolny (4 536 graf/s, stała przepustowość), więc na wykresie
+zestawiono go z wersją autorską na rozmiarach do 1 mln (dla większych ''sito8'' liczono
+by godzinami). Czasy ''sito8'' wyznaczono z pomiaru 100 tys. grafów (22,0 s).
+
+^ Liczba grafów ^ CUDA (autorska) [s] ^ ''sito8'' [s] ^ Stosunek ^
+| 100 000   | 0,21 | 22,0  | ~105× |
+| 500 000   | 0,32 | 110,2 | ~344× |
+| 1 000 000 | 0,27 | 220,4 | ~816× |
+
+<achart>
+ {
+  xaxis: { title: { text: "Liczba grafów (tys.)", offsetY: 5 } },
+  yaxis: { title: { text: "Czas [ms]" }, logarithmic: true },
+  grid: { padding: { bottom: 25 } },
+  series: [
+    { name: "CUDA (autorska)", data: [208, 316, 270] },
+    { name: "sito8 (ref.)",    data: [22000, 110200, 220400] }
+  ],
+  chart: { height: 400, type: 'line', zoom: { enabled: false } },
+  legend: { position: 'top' },
+  dataLabels: { enabled: false },
+  labels: [100, 500, 1000],
+  stroke: { curve: 'straight', width: [3, 3] },
+  colors: ['#FF4560', '#00E396'],
+  markers: { size: 5 }
+ }
+</achart>
+
+== Punkt graniczny (n graniczne) ==
+
+  * **CUDA vs SEQ:** CUDA pokonuje wersję sekwencyjną już dla **~100 tys. grafów** — próg opłacalności GPU względem 1 rdzenia CPU jest niski.
+  * **CUDA vs OpenMP:** po zrównolegleniu dekodowania na hoście CUDA jest **szybsza od OpenMP w całym zakresie ≥ 1 mln** (1M: 0,27 vs 0,32 s; 50M: 5,78 vs 8,73 s — przewaga **1,5×**), a różnica rośnie z rozmiarem (amortyzacja stałych narzutów GPU).
+
+== Skalowalność OpenMP (próbka 2 mln) ==
+
+^ Wątki ^ 1 ^ 2 ^ 4 ^ 8 ^ 12 ^ 16 ^
+^ Czas [s] ^ 3,291 ^ 1,684 ^ 0,959 ^ 0,587 ^ 0,461 ^ 0,402 ^
+^ Przyspieszenie ^ 1,00× ^ 1,95× ^ 3,43× ^ 5,61× ^ 7,14× ^ 8,19× ^
+^ Efektywność ^ 100% ^ 98% ^ 86% ^ 70% ^ 59% ^ 51% ^
+
+== Strojenie CUDA — rozmiar bloku (2 mln, czas całkowity) ==
+
+^ Blok ^ 32 ^ 64 ^ 128 ^ 256 ^ 512 ^ 1024 ^
+^ Czas [s] ^ **0,267** ^ 0,297 ^ 0,309 ^ 0,308 ^ 0,299 ^ 0,296 ^
+
+Najlepszy **blok=32**: jądro jest rejestrochłonne (każdy wątek trzyma na stosie pięć
+tablic ''double[17]'' + macierz ''double[137]''), więc małe bloki zmniejszają nacisk na
+rejestry i poprawiają zajętość (//occupancy//). Uzasadnia to, że nie należy arbitralnie
+ustawiać 256 wątków.
+
+== Wersja zintegrowana GEN: porównanie z potokiem ==
+
+Porównano przepustowość **end-to-end** (generacja + sito łącznie) dla tych samych
+parametrów $n=16, k=46$. Obie wersje uruchomiono na **stały czas 20 s** i zliczono,
+ile grafów każda zdążyła przeanalizować.
+
+^ Wersja ^ Przeanalizowane grafy (20 s) ^ Przepustowość [graf/s] ^
+| Potok ''geng \| sito_omp'' | 7,4 mln | 370 000 |
+| **GEN** (''program_omp'', wbudowany geng) | **36 mln** | **1 800 000** |
+
+GEN jest **~4,9× szybszy** end-to-end. Przyczyna: ''geng'' generuje grafy
+**jednowątkowo** (~194 tys. graf/s), więc w potoku to **generacja jest wąskim gardłem**
+— równoległe sito (zdolne do >4 mln graf/s) czeka na dane. GEN wkompilowuje ''geng''
+jako bibliotekę i zrównolegla samą generację na 16 wątków (podział ''res/mod''),
+wykonując sito w callbacku bez potoku i bez kodowania/dekodowania napisów graph6.
+
+**Uwaga (wada GEN):** wczesne zakończenie (''EXIT_AFTER_FIRST'') woła ''exit()'' z
+wnętrza regionu OpenMP, gdy pozostałe wątki są w ''geng_main'' — prowadzi to do
+zakleszczenia przy sprzątaniu wątków. W praktyce GEN należy uruchamiać do końca
+(lub przerwać sygnałem), a nie kończyć z wnętrza callbacku.
+
+==== Analiza złożoności pamięciowej ====
+
+  * Macierz sąsiedztwa $n=16$ pakowana jest dolnotrójkątnie: na CPU ''double a[137]'', na GPU dodatkowo bitmapa $\lceil 16\cdot15/2 / 32\rceil = 4$ słowa 32-bit na graf.
+  * Solver używa kilku tablic ''double[NMAX+1]'' (lokalnie, na stosie/rejestrach).
+  * **Arytmetyka zmiennoprzecinkowa:** ''double'' (wymagana — patrz wniosek o wariancie float).
+  * GPU: układ **SoA** zapewnia dostęp scalony; brak alokacji/zwalniania w pętli (bufory hosta i urządzenia alokowane raz).
+
+==== Analiza złożoności komunikacyjnej i synchronizacji ====
+
+  * OpenMP: jedyna synchronizacja to bariera na końcu ''parallel for''; brak sekcji krytycznej w pętli gorącej (wynik przez ''hit[]''). Ziarnistość gruba (1 graf = 1 zadanie), równoważenie przez ''schedule(guided/dynamic)''.
+  * CUDA: 1 synchronizacja (''cudaDeviceSynchronize'') na porcję $2^{20}$ grafów (kontrast z ''sito8'': synchronizacja po **każdym** grafie). Transfer H→D/D→H porcjami.
+
+==== Analiza ryzyka błędów wątkowych ====
+
+  * **Thread safety / reentrancja:** solver bezstanowy (tylko zmienne lokalne) → bezpieczny.
+  * **Wyścigi:** wyeliminowane przez rozłączne indeksy w ''hit[]''; potwierdzone determinizmem wyjścia (identyczność z SEQ).
+  * **Zakleszczenia/zagłodzenia:** brak blokad w pętli → niemożliwe.
+
+==== Podsumowanie ====
+
+Zaimplementowano i zweryfikowano trzy wersje sita spektralnego (plus wariant
+zintegrowany GEN) dla problemu generowania spójnych grafów całkowitych $n=16, k=46$.
+Wszystkie dają wyniki zgodne z OEIS A064731 i bajt-w-bajt zgodne między sobą. Na próbce
+50 mln grafów autorskie wersje pokonują kody referencyjne: sekwencyjna **2,48×**
+(''double'' vs ''long double''), OpenMP **24,6×** od ''sito5'', a CUDA **~1900×** od
+''sito8'' (które marnuje GPU przez konfigurację ''<<<1,1>>>''/graf). Wersja CUDA jest
+**najszybsza ze wszystkich** (5,8 s na 50 mln; 1,51× szybsza od OpenMP) — kluczem było
+zrównoleglenie przygotowania danych na hoście (OpenMP) przy zachowaniu solvera na GPU,
+co usuwa ograniczenie wynikające z prawa Amdahla. Wariant GEN (geng jako biblioteka)
+jest end-to-end ~4,9× szybszy od potoku, bo równolegli wąskie gardło, jakim jest
+jednowątkowa generacja. Ponadto wykazano, że algorytm bisekcji Sturma wymaga precyzji
+''double'' (wariant ''float'' się nie zbiega).
+

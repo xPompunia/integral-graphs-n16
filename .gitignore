@@ -1,0 +1,53 @@
+# === Zbudowane programy (odtwarzalne: bash scripts/build_all.sh) ===
+bin/
+*.exe
+*.o
+*.a
+*.lo
+*.la
+
+# Binaria bez rozszerzenia (macOS/Linux) - generowane przez build_all.sh
+# (lista jawna, by nie ignorowac np. skryptow)
+program_omp
+program_seq
+stream_omp
+sito_seq
+sito_omp
+sito_cuda
+sito5
+sito5_omp
+test_cuda_logic
+geng
+labelg
+
+# === Rozpakowane zrodla nauty (odtwarzalne z build/nauty2_8_9.tar.gz) ===
+# Trzymamy w repo TYLKO archiwum .tar.gz; rozpakowane drzewo jest ignorowane.
+build/nauty2_8_9/
+build/original_backup/
+
+# === Duze dane benchmarkowe (odtwarzalne z geng) ===
+# geng -cq 16 46:46 | head -n N > data/bench16_46_*.g6
+data/*.g6
+# ...ale ZACHOWAJ male, istotne pliki wynikowe:
+!data/grafy16L.graph6
+!data/wyniki_0.g6
+!data/wyniki_0_kanoniczne.g6
+!data/wyniki_0_unique.g6
+
+# Pliki tymczasowe benchmarkow
+data/in_*.g6
+data/*.tmp
+data/cs.txt
+data/cstats.txt
+data/tmp_stats.txt
+data/seq_out.txt
+data/cuda_out.txt
+
+# === Smieci systemowe / IDE ===
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# === Lokalne ustawienia narzedzi (nie do repo) ===
+.claude/

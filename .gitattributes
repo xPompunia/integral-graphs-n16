@@ -1,0 +1,19 @@
+# Normalizacja koncow linii - spojnosc miedzy Windows a macOS/Linux.
+# Wszystkie pliki tekstowe trzymane z LF w repo.
+* text=auto eol=lf
+
+# Skrypty powloki ZAWSZE LF (inaczej nie uruchomia sie na Linux/macOS).
+*.sh text eol=lf
+
+# Pliki danych graph6 - tekstowe, LF.
+*.g6      text eol=lf
+*.graph6  text eol=lf
+*.dokuwiki text eol=lf
+
+# Archiwum nauty - binarne, nie ruszaj.
+*.tar.gz binary
+
+# Binaria / artefakty (gdyby jednak trafily) - binarne.
+*.exe binary
+*.o   binary
+*.a   binary
