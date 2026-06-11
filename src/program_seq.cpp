@@ -229,9 +229,9 @@ int compute_sym_eigenvalues(int n, double *mat, int lo, int hi, double *result)
 
 int main(int argc, char *argv[])
 {
-    // Argumenty opcjonalne: remainder divisor
-    // pozwalają na podzielenie pracy między wiele procesów
-    // (proces o numerze `remainder` z `divisor` procesów)
+    // Optional arguments: remainder divisor
+    // allow splitting the work across multiple processes
+    // (this is process number `remainder` out of `divisor` processes)
     int remainder = 0;
     int divisor   = 1;
 

@@ -1,5 +1,5 @@
-// STARA wersja: streaming batch przez stdin (do benchmarku porównawczego)
-// Czyta graph6 ze stdin, robi sito spektralne równolegle OMP, wypisuje wyniki.
+// OLD version: streaming batches via stdin (kept for benchmark comparison)
+// Reads graph6 from stdin, runs the spectral sieve in parallel with OpenMP, writes results.
 
 #include <stdlib.h>
 #include <stdio.h>
